@@ -41,7 +41,7 @@ sudo ln -sf "$(pwd)/meural" /opt/homebrew/bin/meural
 On first run, meural-curator will interactively prompt you for:
 
 1. **Meural account email** (required)
-2. **Children's names & birthdates** (optional — enables age-based photo queries)
+2. **Names & birthdates** (optional — enables age-based photo queries)
 3. **Anthropic API key** — stored in `.credentials.json`
 4. **Meural password** — stored in `.credentials.json`
 
