@@ -1,0 +1,16 @@
+# Credentials and personal config (never commit)
+.credentials.json
+config.json
+.upload_ledger.json
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# macOS
+.DS_Store
+
+# Temporary export files
+tmp/

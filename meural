@@ -1,0 +1,898 @@
+#!/usr/bin/env python3
+"""
+meural-curator: Natural language photo curation for Meural digital frames.
+
+Usage:
+    meural "Create a Meural album with 150 photos of the kids at ages 0-3"
+    meural "Create a Meural album of Christmas pictures over the years"
+    meural "50 best landscape photos from 2024"
+"""
+
+import argparse
+import json
+import os
+import sys
+import tempfile
+import time
+from datetime import datetime, date
+from pathlib import Path
+
+import anthropic
+import boto3
+import osxphotos
+import requests
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+CONFIG_PATH = SCRIPT_DIR / "config.json"
+CREDENTIALS_PATH = SCRIPT_DIR / ".credentials.json"
+UPLOAD_LEDGER_PATH = SCRIPT_DIR / ".upload_ledger.json"
+
+MEURAL_API_BASE = "https://api.meural.com/v0/"
+COGNITO_CLIENT_ID = "487bd4kvb1fnop6mbgk8gu5ibf"
+COGNITO_REGION = "eu-west-1"
+
+
+def load_config():
+    if CONFIG_PATH.exists():
+        with open(CONFIG_PATH) as f:
+            return json.load(f)
+
+    # First-run interactive setup
+    print("  No config.json found — let's set one up.\n")
+
+    email = ""
+    while not email:
+        email = input("  Meural account email: ").strip()
+
+    children = {}
+    print("\n  Add children for age-based photo queries (optional).")
+    print("  Press Enter with a blank name when done.\n")
+    while True:
+        name = input("  Child's name: ").strip()
+        if not name:
+            break
+        dob = input(f"  {name}'s birthdate (YYYY-MM-DD): ").strip()
+        children[name] = dob
+
+    config = {"meural_email": email, "children": children}
+    with open(CONFIG_PATH, "w") as f:
+        json.dump(config, f, indent=4)
+    print(f"\n  Config saved to {CONFIG_PATH}\n")
+    return config
+
+
+def load_credentials():
+    if CREDENTIALS_PATH.exists():
+        with open(CREDENTIALS_PATH) as f:
+            return json.load(f)
+    return {}
+
+
+def save_credentials(creds):
+    with open(CREDENTIALS_PATH, "w") as f:
+        json.dump(creds, f)
+    os.chmod(CREDENTIALS_PATH, 0o600)
+
+
+# ---------------------------------------------------------------------------
+# Meural API client
+# ---------------------------------------------------------------------------
+
+class MeuralClient:
+    def __init__(self, email, password):
+        self.email = email
+        self.password = password
+        self.token = None
+        self._authenticate()
+
+    def _authenticate(self):
+        """Authenticate via AWS Cognito to get an access token."""
+        print("  Authenticating with Meural...")
+        client = boto3.client(
+            "cognito-idp",
+            region_name=COGNITO_REGION,
+            aws_access_key_id="dummy",
+            aws_secret_access_key="dummy",
+        )
+        resp = client.initiate_auth(
+            ClientId=COGNITO_CLIENT_ID,
+            AuthFlow="USER_PASSWORD_AUTH",
+            AuthParameters={
+                "USERNAME": self.email,
+                "PASSWORD": self.password,
+            },
+        )
+        self.token = resp["AuthenticationResult"]["AccessToken"]
+        print("  Authenticated.")
+
+    def _headers(self):
+        return {
+            "Authorization": f"Token {self.token}",
+            "x-meural-api-version": "3",
+        }
+
+    def _get(self, path, params=None):
+        r = requests.get(MEURAL_API_BASE + path, headers=self._headers(), params=params)
+        r.raise_for_status()
+        return r.json().get("data", r.json())
+
+    def _post(self, path, data=None, files=None, json_body=None):
+        r = requests.post(
+            MEURAL_API_BASE + path,
+            headers=self._headers(),
+            data=data,
+            files=files,
+            json=json_body,
+        )
+        r.raise_for_status()
+        return r.json().get("data", r.json())
+
+    def get_user(self):
+        return self._get("user")
+
+    def get_devices(self):
+        return self._get("user/devices", params={"count": 50, "page": 1})
+
+    def get_galleries(self):
+        return self._get("user/galleries", params={"count": 100, "page": 1})
+
+    def create_gallery(self, name, orientation="vertical"):
+        print(f"  Creating gallery: {name}")
+        return self._post("galleries", data={"name": name, "orientation": orientation})
+
+    def upload_image(self, filepath):
+        """Upload an image file with automatic re-auth on 401. Returns the item data dict."""
+        filename = os.path.basename(filepath)
+        content_type = "image/jpeg"
+        if filepath.lower().endswith(".png"):
+            content_type = "image/png"
+        elif filepath.lower().endswith(".heic"):
+            content_type = "image/heic"
+
+        for attempt in range(2):
+            with open(filepath, "rb") as f:
+                r = requests.post(
+                    MEURAL_API_BASE + "items",
+                    headers=self._headers(),
+                    files={"image": (filename, f, content_type)},
+                )
+            if r.status_code == 401 and attempt == 0:
+                self._authenticate()
+                continue
+            r.raise_for_status()
+            return r.json().get("data", r.json())
+
+    def add_item_to_gallery(self, gallery_id, item_id):
+        return self._post(f"galleries/{gallery_id}/items/{item_id}")
+
+    def load_gallery_on_device(self, device_id, gallery_id):
+        return self._post(f"devices/{device_id}/galleries/{gallery_id}")
+
+
+# ---------------------------------------------------------------------------
+# Photo query engine (wraps osxphotos)
+# ---------------------------------------------------------------------------
+
+class PhotoQueryEngine:
+    def __init__(self, config):
+        print("  Loading Photos library...")
+        self.db = osxphotos.PhotosDB()
+        self.config = config
+        self.children_dobs = {}
+        for name, dob_str in config.get("children", {}).items():
+            self.children_dobs[name.lower()] = datetime.strptime(dob_str, "%Y-%m-%d").date()
+        print(f"  Loaded {len(self.db.photos())} photos.")
+
+    def get_available_persons(self):
+        return [p for p in self.db.persons if p != "_UNKNOWN_"]
+
+    def query_photos(
+        self,
+        persons=None,
+        min_age_years=None,
+        max_age_years=None,
+        person_for_age=None,
+        date_start=None,
+        date_end=None,
+        labels=None,
+        holidays=None,
+        min_score=None,
+        max_photos=None,
+        distribution_strategy="even_time",
+        month_filter=None,
+        orientation_filter=None,
+    ):
+        """
+        Query photos with flexible filters. Returns list of PhotoInfo objects.
+        orientation_filter: "landscape", "portrait", or None
+        """
+        # Start with person filter if specified
+        if persons:
+            photos = []
+            for person in persons:
+                photos.extend(self.db.photos(persons=[person]))
+            # Deduplicate by UUID
+            seen = set()
+            unique = []
+            for p in photos:
+                if p.uuid not in seen:
+                    seen.add(p.uuid)
+                    unique.append(p)
+            photos = unique
+        else:
+            photos = list(self.db.photos())
+
+        # Filter by age (requires a person to calculate age from)
+        if min_age_years is not None or max_age_years is not None:
+            age_persons = person_for_age if person_for_age else (persons or [])
+            photos = self._filter_by_age(photos, age_persons, min_age_years, max_age_years)
+
+            # Supplement with newborn photos if the age range includes early months
+            if persons and min_age_years is not None and min_age_years <= 0.5:
+                existing_uuids = {p.uuid for p in photos}
+                for person in persons:
+                    newborn = self._find_newborn_photos(person)
+                    # Apply orientation filter to newborn photos too
+                    if orientation_filter == "landscape":
+                        newborn = [p for p in newborn if p.width and p.height and p.width > p.height]
+                    elif orientation_filter == "portrait":
+                        newborn = [p for p in newborn if p.width and p.height and p.height > p.width]
+                    for p in newborn:
+                        if p.uuid not in existing_uuids:
+                            photos.append(p)
+                            existing_uuids.add(p.uuid)
+
+        # Filter by date range
+        if date_start or date_end:
+            photos = self._filter_by_date(photos, date_start, date_end)
+
+        # Filter by month, labels, and holidays using OR logic
+        # (a Christmas photo might match via holiday tag OR label OR month)
+        has_thematic_filter = month_filter or labels or holidays
+        if has_thematic_filter:
+            labels_lower = [l.lower() for l in labels] if labels else []
+            holidays_lower = [h.lower() for h in holidays] if holidays else []
+            filtered = []
+            for p in photos:
+                matched = False
+                # Match by month
+                if month_filter and p.date and p.date.month in month_filter:
+                    matched = True
+                # Match by label
+                if not matched and labels_lower and p.labels:
+                    if any(l.lower() in labels_lower for l in p.labels):
+                        matched = True
+                # Match by holiday
+                if not matched and holidays_lower:
+                    si = p.search_info_normalized
+                    if si and si.holidays:
+                        if any(h in holidays_lower for h in si.holidays):
+                            matched = True
+                if matched:
+                    filtered.append(p)
+            photos = filtered
+
+        # Filter by minimum score
+        if min_score is not None:
+            photos = [p for p in photos if p.score and p.score.overall and p.score.overall >= min_score]
+
+        # Filter out screenshots, selfies, and videos (Meural only accepts images)
+        photos = [p for p in photos if not p.screenshot and not p.selfie and p.isphoto]
+
+        # Filter by orientation (landscape = wider than tall, portrait = taller than wide)
+        if orientation_filter == "landscape":
+            photos = [p for p in photos if p.width and p.height and p.width > p.height]
+        elif orientation_filter == "portrait":
+            photos = [p for p in photos if p.width and p.height and p.height > p.width]
+
+        # Apply distribution and selection
+        if max_photos and len(photos) > max_photos:
+            photos = self._distribute_and_select(photos, max_photos, distribution_strategy)
+
+        return photos
+
+    def _find_newborn_photos(self, person, max_age_months=6):
+        """
+        Find probable newborn photos for a child that face recognition missed.
+        Looks for photos with 'Baby' label near the child's birthdate where the
+        child isn't recognized (tagged as _UNKNOWN_ or no person).
+        """
+        dob = self.children_dobs.get(person.lower())
+        if not dob:
+            return []
+
+        from datetime import timedelta
+        window_start = dob
+        window_end = dob + timedelta(days=max_age_months * 30)
+
+        # Get all photos in the time window with 'Baby' label
+        candidates = []
+        for p in self.db.photos():
+            if not p.date:
+                continue
+            photo_date = p.date.date() if hasattr(p.date, 'date') else p.date
+            if photo_date < window_start or photo_date > window_end:
+                continue
+            if not p.labels or 'Baby' not in p.labels:
+                continue
+            if p.screenshot:
+                continue
+
+            # Include if: no person recognized, or _UNKNOWN_, or a family member
+            # is in the photo (parent holding baby), but the child is not tagged
+            person_names = [n.lower() for n in (p.persons or [])]
+            if person.lower() not in person_names:
+                # Exclude photos where a DIFFERENT known child is the baby
+                # (check if another child's DOB is closer to this photo date)
+                dominated_by_other = False
+                for other_name, other_dob in self.children_dobs.items():
+                    if other_name == person.lower():
+                        continue
+                    other_age_days = (photo_date - other_dob).days
+                    this_age_days = (photo_date - dob).days
+                    if 0 <= other_age_days <= max_age_months * 30 and other_age_days < this_age_days:
+                        dominated_by_other = True
+                        break
+                if not dominated_by_other:
+                    candidates.append(p)
+
+        return candidates
+
+    def query_per_person_distributed(self, persons, photos_per_person, min_age_years=None, max_age_years=None, min_score=0.3, orientation_filter=None):
+        """
+        Query photos for multiple persons, distributing evenly across each person's time range.
+        Returns combined list.
+        """
+        all_selected = []
+        for person in persons:
+            person_photos = self.db.photos(persons=[person])
+            person_photos = [p for p in person_photos if not p.screenshot and not p.selfie and p.isphoto]
+
+            # Filter by orientation
+            if orientation_filter == "landscape":
+                person_photos = [p for p in person_photos if p.width and p.height and p.width > p.height]
+            elif orientation_filter == "portrait":
+                person_photos = [p for p in person_photos if p.width and p.height and p.height > p.width]
+
+            if min_age_years is not None or max_age_years is not None:
+                person_photos = self._filter_by_age(person_photos, [person], min_age_years, max_age_years)
+
+                # Supplement with newborn photos if the age range includes early months
+                if min_age_years is not None and min_age_years <= 0.5:
+                    newborn = self._find_newborn_photos(person)
+                    # Apply same orientation filter to newborn photos
+                    if orientation_filter == "landscape":
+                        newborn = [p for p in newborn if p.width and p.height and p.width > p.height]
+                    elif orientation_filter == "portrait":
+                        newborn = [p for p in newborn if p.width and p.height and p.height > p.width]
+                    # Add newborn photos that aren't already in the set
+                    existing_uuids = {p.uuid for p in person_photos}
+                    added = 0
+                    for p in newborn:
+                        if p.uuid not in existing_uuids:
+                            person_photos.append(p)
+                            existing_uuids.add(p.uuid)
+                            added += 1
+                    if added:
+                        print(f"    {person}: added {added} newborn photos via Baby label matching")
+
+            if min_score is not None:
+                person_photos = [p for p in person_photos if p.score and p.score.overall and p.score.overall >= min_score]
+
+            if len(person_photos) > photos_per_person:
+                person_photos = self._distribute_and_select(person_photos, photos_per_person, "even_time")
+
+            print(f"    {person}: selected {len(person_photos)} photos")
+            all_selected.extend(person_photos)
+
+        return all_selected
+
+    def _filter_by_age(self, photos, persons, min_age_years, max_age_years):
+        """Filter photos where the photo date falls within the age range for any of the given persons."""
+        filtered = []
+        for p in photos:
+            if not p.date:
+                continue
+            photo_date = p.date.date() if hasattr(p.date, 'date') else p.date
+            for person in persons:
+                dob = self.children_dobs.get(person.lower())
+                if not dob:
+                    continue
+                age_days = (photo_date - dob).days
+                age_years = age_days / 365.25
+                if (min_age_years is None or age_years >= min_age_years) and \
+                   (max_age_years is None or age_years <= max_age_years):
+                    filtered.append(p)
+                    break
+        return filtered
+
+    def _filter_by_date(self, photos, date_start, date_end):
+        filtered = []
+        for p in photos:
+            if not p.date:
+                continue
+            photo_date = p.date.date() if hasattr(p.date, 'date') else p.date
+            if date_start and photo_date < date_start:
+                continue
+            if date_end and photo_date > date_end:
+                continue
+            filtered.append(p)
+        return filtered
+
+    def _distribute_and_select(self, photos, max_photos, strategy):
+        """Select max_photos distributed evenly across time, picking highest scored in each bucket."""
+        if not photos:
+            return []
+
+        # Sort by date
+        dated = [(p, p.date) for p in photos if p.date]
+        dated.sort(key=lambda x: x[1])
+
+        if not dated:
+            return photos[:max_photos]
+
+        # Create time buckets
+        n_buckets = min(max_photos, len(dated))
+        bucket_size = len(dated) / n_buckets
+        selected = []
+
+        for i in range(n_buckets):
+            start_idx = int(i * bucket_size)
+            end_idx = int((i + 1) * bucket_size)
+            bucket = dated[start_idx:end_idx]
+            if not bucket:
+                continue
+            # Pick the highest scored photo in this bucket
+            best = max(bucket, key=lambda x: (x[0].score.overall if x[0].score and x[0].score.overall else 0))
+            selected.append(best[0])
+
+        return selected
+
+    def export_photos(self, photos, dest_dir):
+        """Export photos to a destination directory via PhotoScript (handles iCloud downloads)."""
+        import photoscript
+
+        exported = []
+        failed = 0
+        for i, photo in enumerate(photos):
+            try:
+                ps_photo = photoscript.Photo(photo.uuid)
+                results = ps_photo.export(dest_dir)
+                if results:
+                    # Filter out videos (Live Photo video components, etc.)
+                    image_exts = {".jpg", ".jpeg", ".png", ".heic", ".gif", ".tiff", ".bmp"}
+                    img_results = [r for r in results if os.path.splitext(r)[1].lower() in image_exts]
+                    if img_results:
+                        exported.append(img_results[0])
+                    else:
+                        failed += 1
+                else:
+                    failed += 1
+            except Exception as e:
+                failed += 1
+                if failed <= 3:
+                    print(f"    Warning: Failed to export {photo.filename}: {e}")
+            if (i + 1) % 10 == 0:
+                print(f"    Exported {i+1}/{len(photos)} ({len(exported)} ok, {failed} failed)...")
+        if failed:
+            print(f"    {failed} photos could not be exported (may still be downloading from iCloud).")
+        return exported
+
+
+# ---------------------------------------------------------------------------
+# Claude AI planner - interprets natural language into structured queries
+# ---------------------------------------------------------------------------
+
+SYSTEM_PROMPT = """You are a photo curation assistant. The user will describe what kind of Meural photo album they want.
+You must translate their request into a structured JSON query plan.
+
+Available data about the photo library:
+- Persons (face recognition): {persons}
+- Children with known birthdates: {children}
+- Photos can be filtered by: persons, date ranges, age of children, labels (ML-detected objects/scenes), holidays (auto-detected by Apple Photos like "Christmas Day", "Thanksgiving"), aesthetic quality scores (0-1), and photo orientation (landscape or portrait).
+- Labels include things like: Christmas Tree, Beach, Mountain, Dog, Food, Sunset, Snow, etc.
+- Holidays detected include: Christmas Day, Thanksgiving, Halloween, etc.
+- Photos have quality scores from 0 to 1 (overall aesthetic score from Apple's ML).
+- Photos can be filtered by orientation: "landscape" (wider than tall) or "portrait" (taller than wide). The Meural frame displays landscape photos best.
+
+You MUST respond with ONLY a JSON object (no markdown, no explanation) with this exact structure:
+
+{{
+    "gallery_name": "string - name for the Meural gallery/playlist",
+    "orientation": "vertical" or "horizontal",
+    "strategy": "per_person_distributed" or "single_query",
+    "description": "brief description of what this album will contain",
+    "total_photos": number (default 100 if not specified),
+
+    // For strategy "per_person_distributed":
+    "per_person": {{
+        "persons": ["Name1", "Name2"],
+        "photos_per_person": number,
+        "min_age_years": number or null,
+        "max_age_years": number or null,
+        "min_score": number (0-1, default 0.3),
+        "orientation_filter": "landscape" or "portrait" or null
+    }},
+
+    // For strategy "single_query":
+    "query": {{
+        "persons": ["Name"] or null,
+        "min_age_years": number or null,
+        "max_age_years": number or null,
+        "person_for_age": ["Name"] or null,
+        "date_start": "YYYY-MM-DD" or null,
+        "date_end": "YYYY-MM-DD" or null,
+        "labels": ["Label1", "Label2"] or null,
+        "holidays": ["Christmas Day"] or null,
+        "month_filter": [12] or null,
+        "min_score": number (0-1, default 0.3),
+        "max_photos": number,
+        "distribution_strategy": "even_time",
+        "orientation_filter": "landscape" or "portrait" or null
+    }}
+}}
+
+Important rules:
+- Person names must EXACTLY match one of the available persons listed above.
+- For children's age-based queries, use per_person_distributed strategy.
+- For "ages 0-3", set min_age_years=0, max_age_years=3.
+- For holiday queries, combine holidays filter with relevant labels AND month_filter for best coverage.
+- Christmas photos: use holidays=["Christmas Day"], labels=["Christmas Tree", "Christmas"], month_filter=[12].
+- Default min_score to 0.3 to filter out obviously bad photos. Use higher (0.5-0.7) for "best" requests.
+- For "over the years" or "through the years", use even_time distribution to spread across years.
+- gallery_name should be descriptive and concise.
+- orientation should be "vertical" for portrait-heavy content (kids, people) and "horizontal" for landscapes.
+- orientation_filter controls which photos are selected by their aspect ratio: "landscape" for wide photos, "portrait" for tall photos, null for no preference. If the user asks for landscape/horizontal photos, set orientation_filter to "landscape". If they ask for portrait/vertical photos, set it to "portrait".
+- Today's date is {today}.
+"""
+
+
+def get_anthropic_api_key():
+    """Get Anthropic API key from environment, config, or credentials."""
+    key = os.environ.get("ANTHROPIC_API_KEY")
+    if key:
+        return key
+    creds = load_credentials()
+    if creds.get("anthropic_api_key"):
+        return creds["anthropic_api_key"]
+    import getpass
+    key = getpass.getpass("Enter your Anthropic API key: ")
+    creds["anthropic_api_key"] = key
+    save_credentials(creds)
+    return key
+
+
+def plan_query(user_prompt, config, available_persons):
+    """Use Claude to interpret the natural language request into a structured query plan."""
+    children_info = {name: dob for name, dob in config.get("children", {}).items()}
+
+    client = anthropic.Anthropic(api_key=get_anthropic_api_key())
+    response = client.messages.create(
+        model="claude-sonnet-4-5-20250929",
+        max_tokens=1024,
+        system=SYSTEM_PROMPT.format(
+            persons=available_persons,
+            children=json.dumps(children_info),
+            today=date.today().isoformat(),
+        ),
+        messages=[{"role": "user", "content": user_prompt}],
+    )
+
+    text = response.content[0].text.strip()
+    # Strip markdown code fences if present
+    if text.startswith("```"):
+        text = text.split("\n", 1)[1]
+        if text.endswith("```"):
+            text = text.rsplit("```", 1)[0]
+    return json.loads(text)
+
+
+# ---------------------------------------------------------------------------
+# Main orchestrator
+# ---------------------------------------------------------------------------
+
+def execute_plan(plan, engine):
+    """Execute a query plan and return selected photos."""
+    strategy = plan.get("strategy", "single_query")
+
+    if strategy == "per_person_distributed":
+        pp = plan["per_person"]
+        return engine.query_per_person_distributed(
+            persons=pp["persons"],
+            photos_per_person=pp["photos_per_person"],
+            min_age_years=pp.get("min_age_years"),
+            max_age_years=pp.get("max_age_years"),
+            min_score=pp.get("min_score", 0.3),
+            orientation_filter=pp.get("orientation_filter"),
+        )
+    else:
+        q = plan["query"]
+        return engine.query_photos(
+            persons=q.get("persons"),
+            min_age_years=q.get("min_age_years"),
+            max_age_years=q.get("max_age_years"),
+            person_for_age=q.get("person_for_age"),
+            date_start=date.fromisoformat(q["date_start"]) if q.get("date_start") else None,
+            date_end=date.fromisoformat(q["date_end"]) if q.get("date_end") else None,
+            labels=q.get("labels"),
+            holidays=q.get("holidays"),
+            min_score=q.get("min_score", 0.3),
+            max_photos=q.get("max_photos", plan.get("total_photos", 100)),
+            distribution_strategy=q.get("distribution_strategy", "even_time"),
+            month_filter=q.get("month_filter"),
+            orientation_filter=q.get("orientation_filter"),
+        )
+
+
+def upload_to_meural(meural, photos, engine, gallery_name, orientation="vertical", device_id=None):
+    """Export photos and upload them to Meural, creating a gallery."""
+    # Create gallery
+    gallery_data = meural.create_gallery(gallery_name, orientation)
+    gallery_id = gallery_data["id"]
+    print(f"  Gallery created: {gallery_name} (ID: {gallery_id})")
+
+    # Export and upload
+    with tempfile.TemporaryDirectory() as tmpdir:
+        print(f"  Preparing {len(photos)} photos for upload...")
+        paths = engine.export_photos(photos, tmpdir)
+
+        # Filter out any non-image files (videos etc.)
+        image_exts = {".jpg", ".jpeg", ".png", ".heic", ".gif", ".tiff", ".bmp"}
+        paths = [p for p in paths if os.path.splitext(p)[1].lower() in image_exts]
+
+        # Re-authenticate right before uploading (token may have expired during export)
+        meural._authenticate()
+
+        uploaded = 0
+        failed_paths = []
+        print(f"  Uploading {len(paths)} photos to Meural...")
+        for i, path in enumerate(paths):
+            # Re-authenticate every 30 uploads to avoid token expiry
+            if i > 0 and i % 30 == 0:
+                meural._authenticate()
+
+            success = False
+            for attempt in range(3):
+                try:
+                    item_data = meural.upload_image(path)
+                    item_id = item_data["id"]
+                    meural.add_item_to_gallery(gallery_id, item_id)
+                    uploaded += 1
+                    success = True
+                    break
+                except requests.exceptions.HTTPError as e:
+                    status = e.response.status_code if e.response is not None else 0
+                    if status == 400:
+                        # Bad file, don't retry
+                        print(f"    Skipped {os.path.basename(path)}: not accepted by Meural")
+                        break
+                    elif status == 401:
+                        meural._authenticate()
+                    elif status in (502, 504) and attempt < 2:
+                        time.sleep(2 * (attempt + 1))
+                    else:
+                        print(f"    Warning: Failed to upload {os.path.basename(path)}: {e}")
+                        break
+                except Exception as e:
+                    print(f"    Warning: Failed to upload {os.path.basename(path)}: {e}")
+                    break
+
+            if not success:
+                failed_paths.append(path)
+
+            if (i + 1) % 10 == 0:
+                print(f"    Uploaded {i+1}/{len(paths)} ({uploaded} succeeded)...")
+
+        if failed_paths:
+            print(f"  {len(failed_paths)} photos could not be uploaded.")
+
+    # Load gallery on device if we know the device
+    if device_id:
+        print(f"  Loading gallery on device {device_id}...")
+        try:
+            meural.load_gallery_on_device(device_id, gallery_id)
+            print(f"  Gallery loaded on device.")
+        except Exception as e:
+            print(f"  Note: Could not auto-load gallery on device ({e}).")
+            print(f"  You can load it manually from the Meural app.")
+
+    return gallery_id
+
+
+def get_meural_password():
+    """Get or prompt for Meural password."""
+    creds = load_credentials()
+    if creds.get("meural_password"):
+        return creds["meural_password"]
+
+    import getpass
+    password = getpass.getpass("Enter your Meural (Netgear) account password: ")
+    creds["meural_password"] = password
+    save_credentials(creds)
+    return password
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Natural language photo curation for Meural frames",
+        usage='meural "Create an album of Christmas pictures over the years"',
+    )
+    parser.add_argument("prompt", nargs="?", help="Natural language description of the album you want")
+    parser.add_argument("--dry-run", action="store_true", help="Plan and select photos but don't upload to Meural")
+    parser.add_argument("--no-preview", action="store_true", help="Skip the preview step and upload directly")
+    parser.add_argument("--show-plan", action="store_true", help="Show the query plan Claude generates")
+    parser.add_argument("--list-devices", action="store_true", help="List your Meural devices")
+    parser.add_argument("--list-galleries", action="store_true", help="List your Meural galleries")
+    parser.add_argument("--device", type=str, help="Meural device ID to load the gallery on")
+
+    args = parser.parse_args()
+    config = load_config()
+
+    # Handle Meural-only commands
+    if args.list_devices or args.list_galleries:
+        password = get_meural_password()
+        meural = MeuralClient(config["meural_email"], password)
+        if args.list_devices:
+            devices = meural.get_devices()
+            print("\nYour Meural devices:")
+            for d in devices:
+                print(f"  ID: {d['id']}  Name: {d.get('name', 'unnamed')}  Status: {d.get('status', 'unknown')}")
+        if args.list_galleries:
+            galleries = meural.get_galleries()
+            print("\nYour Meural galleries:")
+            for g in galleries:
+                print(f"  ID: {g['id']}  Name: {g.get('name', 'unnamed')}  Items: {g.get('itemCount', '?')}")
+        return
+
+    if not args.prompt:
+        parser.print_help()
+        return
+
+    print(f'\n  Prompt: "{args.prompt}"\n')
+
+    # Step 1: Load Photos library and get available metadata
+    engine = PhotoQueryEngine(config)
+    available_persons = engine.get_available_persons()
+
+    # Step 2: Use Claude to interpret the prompt
+    print("  Interpreting your request with Claude...")
+    plan = plan_query(args.prompt, config, available_persons)
+
+    if args.show_plan or args.dry_run:
+        print(f"\n  Query plan:")
+        print(f"  {json.dumps(plan, indent=2)}")
+        print()
+
+    print(f'  Album: {plan["gallery_name"]}')
+    print(f'  Description: {plan.get("description", "")}')
+    print(f'  Target: {plan.get("total_photos", "?")} photos\n')
+
+    # Step 3: Execute the query
+    print("  Selecting photos...")
+    photos = execute_plan(plan, engine)
+    print(f"  Selected {len(photos)} photos.\n")
+
+    if not photos:
+        print("  No photos matched the criteria. Try broadening your request.")
+        return
+
+    # Show date range of selected photos
+    dates = sorted([p.date for p in photos if p.date])
+    if dates:
+        print(f"  Date range: {dates[0].strftime('%Y-%m-%d')} to {dates[-1].strftime('%Y-%m-%d')}")
+
+    # Show score summary
+    scores = [p.score.overall for p in photos if p.score and p.score.overall]
+    if scores:
+        print(f"  Quality scores: min={min(scores):.2f}, avg={sum(scores)/len(scores):.2f}, max={max(scores):.2f}")
+
+    print()
+
+    if args.dry_run:
+        print("  Dry run - not uploading to Meural.")
+        print(f"  Would create gallery: {plan['gallery_name']}")
+        print(f"  Would upload {len(photos)} photos.")
+        return
+
+    # Step 4: Preview in Apple Photos and confirm
+    if not args.no_preview:
+        import photoscript
+        import subprocess
+
+        preview_name = f"Meural Preview - {plan['gallery_name']}"
+        print(f"  Creating preview album in Photos: \"{preview_name}\"")
+
+        photos_app = photoscript.PhotosLibrary()
+
+        # Delete any existing preview album with same name (use AppleScript directly to avoid bug)
+        try:
+            import subprocess as _sp
+            _sp.run(["osascript", "-e", f'''
+                tell application "Photos"
+                    set matchingAlbums to (every album whose name is "{preview_name}")
+                    repeat with a in matchingAlbums
+                        delete a
+                    end repeat
+                end tell
+            '''], capture_output=True, timeout=15)
+        except Exception:
+            pass
+
+        album = photos_app.create_album(preview_name)
+        original_uuids = {p.uuid for p in photos}
+        ps_photos = [photoscript.Photo(p.uuid) for p in photos]
+        album.add(ps_photos)
+        print(f"  Added {len(ps_photos)} photos to preview album.")
+
+        # Open Photos app to the album
+        subprocess.run(["open", "-a", "Photos"])
+        print()
+        print(f"  >> Open Photos and look at the album \"{preview_name}\"")
+        print(f"  >> Remove any photos you don't want (select and hit Delete).")
+        print(f"  >> When done reviewing, come back here.")
+        print()
+
+        try:
+            response = input("  Upload to Meural? [y/n]: ").strip().lower()
+        except EOFError:
+            response = "n"
+
+        if response != "y":
+            print("  Cancelled. The preview album is still in Photos if you want to browse it.")
+            return
+
+        # Read back the album to see what the user kept
+        remaining_uuids = set()
+        try:
+            for ps_photo in album.photos():
+                remaining_uuids.add(ps_photo.uuid)
+        except Exception:
+            # If we can't read back, fall through with original set
+            remaining_uuids = original_uuids
+
+        removed = len(original_uuids) - len(remaining_uuids)
+        if removed > 0:
+            photos = [p for p in photos if p.uuid in remaining_uuids]
+            print(f"  You removed {removed} photos. Uploading {len(photos)}.")
+        else:
+            print(f"  Uploading all {len(photos)} photos.")
+
+        # Clean up preview album
+        try:
+            photos_app.delete_album(album)
+        except Exception:
+            pass
+        print("  Preview album removed from Photos.")
+        print()
+
+    # Step 5: Upload to Meural
+    password = get_meural_password()
+    meural = MeuralClient(config["meural_email"], password)
+
+    # Auto-detect device if not specified
+    device_id = args.device
+    if not device_id:
+        devices = meural.get_devices()
+        if devices:
+            device_id = devices[0]["id"]
+            print(f'  Auto-selected device: {devices[0].get("name", device_id)}')
+
+    gallery_id = upload_to_meural(
+        meural, photos, engine,
+        gallery_name=plan["gallery_name"],
+        orientation=plan.get("orientation", "vertical"),
+        device_id=device_id,
+    )
+
+    print(f"\n  Done! Gallery '{plan['gallery_name']}' created with {len(photos)} photos.")
+    if device_id:
+        print(f"  Gallery loaded on your Meural device.")
+    print()
+
+
+if __name__ == "__main__":
+    main()
